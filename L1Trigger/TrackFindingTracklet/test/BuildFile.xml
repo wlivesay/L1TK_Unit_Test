@@ -21,4 +21,4 @@
   <use name="L1Trigger/TrackerTFP"/>
 </library>
 
-<test name="L1TK_Unit_Test" command="L1TKUnitTest.sh"/>
+<test name="L1TK_Unit_Test" command="l1tk-test.sh -e 100 -j 1"/>
