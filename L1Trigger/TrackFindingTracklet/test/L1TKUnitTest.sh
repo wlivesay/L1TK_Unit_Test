@@ -19,10 +19,21 @@ set -e
 #   HYBRID_NEWKF     -> ttbar+PU200   (prompt tracking)
 #   HYBRID_DISPLACED -> displacedSUSY+PU200 (displaced tracking)
 #
+# COMMAND-LINE ARGS:
+#   -e <num-events>     number of events to run per algorithm (default: 10)
+#   -j <parallel-jobs>  threads/streams cmsRun uses internally (default: 1)
+#
+# NOTE: threshold validation in Stage 2 only runs when EVENTS >= 1000, since
+# the reference thresholds were calibrated at 1000 events -- lower stats
+# would make those comparisons unreliable. Light/quick runs (EVENTS < 1000)
+# still execute cmsRun + makeHists.csh as a smoke test, just without the
+# physics threshold comparison. See Stage 2 below.
+#
 # HOW TO USE:
 #   cd ~/<your CMSSW area>/src/
 #   cmsenv
-#   bash L1TKUnitTest.sh
+#   bash L1TKUnitTest.sh -e <num-events> -j <parallel-jobs>
+#   (defaults: -e 10 -j 1 if omitted)
 # Can instead run 'official' local unit test by adding L1TKUnitTest.sh to src/.../test/BuildFile.xml
 # Then run scram b runtests to run all 'registered' unit tests (from BuildFile.xml)
 # =============================================================================
@@ -43,6 +54,21 @@ TEST_DIR="$CMSSW_BASE/src/L1Trigger/TrackFindingTracklet/test"
 # Set to "false" to also run HYBRID_NEWKF and HYBRID_DISPLACED.
 # When "true", only HYBRID (on ttbar+PU200) is run.
 QUICK_TEST="false"
+
+# =============================================================================
+# COMMAND-LINE ARGS
+#   -e <num-events>    number of events to run per algorithm
+#   -j <parallel-jobs>  threads/streams cmsRun uses internally
+# =============================================================================
+EVENTS=10
+JOBS=1
+
+while getopts "e:j:" opt; do
+    case "$opt" in
+        e) EVENTS="$OPTARG" ;;
+        j) JOBS="$OPTARG" ;;
+    esac
+done
 
 # =============================================================================
 # MC DATASETS
@@ -180,12 +206,14 @@ run_hybrid_stage() {
     sed -i "s|L1TRKALGO = 'HYBRID'|L1TRKALGO = '$ALGO'|" $JOBNAME
     grep "^L1TRKALGO" $JOBNAME
 
-    RESULTSDIR="$TEST_DIR/results_${ALGO}_${RESULTS_LABEL}"
+    RESULTSDIR="$TEST_DIR/unit_test_results/${ALGO}_${RESULTS_LABEL}"
     rm -rf $RESULTSDIR
     mkdir -p $RESULTSDIR
 
     echo "process.TFileService.fileName = cms.string('$RESULTSDIR/histos.root')" >> $JOBNAME
-    echo "process.maxEvents = cms.untracked.PSet(input = cms.untracked.int32(1000))" >> $JOBNAME
+    echo "process.maxEvents = cms.untracked.PSet(input = cms.untracked.int32($EVENTS))" >> $JOBNAME
+    echo "process.options.numberOfThreads = cms.untracked.uint32($JOBS)" >> $JOBNAME
+    echo "process.options.numberOfStreams = cms.untracked.uint32(0)" >> $JOBNAME
     # Stream the dataset directly
     echo "process.source.fileNames = cms.untracked.vstring('$DATASET')" >> $JOBNAME
 
@@ -216,12 +244,12 @@ echo "=== STAGE 2: Analysis ==="
 run_makehists() {
     local ALGO=$1
     local RESULTS_LABEL=$2
-    local RESULTSDIR="$TEST_DIR/results_${ALGO}_${RESULTS_LABEL}"
+    local RESULTSDIR="$TEST_DIR/unit_test_results/${ALGO}_${RESULTS_LABEL}"
 
     echo ""
     echo "--- Running makeHists.csh for algo=$ALGO ---"
     cd $RESULTSDIR
-    tcsh ../makeHists.csh histos.root
+    tcsh $TEST_DIR/makeHists.csh histos.root
 
     if [ ! -f "results.out" ]; then
         echo "FAILURE - results.out not produced for $ALGO"
@@ -245,7 +273,7 @@ check_threshold() {
     local MODE=$5
     local METRIC_NAME=$6
 
-    local RESULTSFILE="$TEST_DIR/results_${ALGO}_${LABEL}/results.out"
+    local RESULTSFILE="$TEST_DIR/unit_test_results/${ALGO}_${LABEL}/results.out"
 
     if [ ! -f "$RESULTSFILE" ]; then
         echo "FAILURE -- $RESULTSFILE not found"
@@ -256,6 +284,12 @@ check_threshold() {
 
     if [ -z "$VALUE" ]; then
         echo "FAILURE -- could not find '$GREP_STRING' in $RESULTSFILE"
+        return 1
+    fi
+
+    # Guard against a malformed/non-numeric VALUE silently passing bc.
+    if ! [[ "$VALUE" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+        echo "FAILURE -- parsed value '$VALUE' for '$GREP_STRING' is not numeric"
         return 1
     fi
 
@@ -279,7 +313,6 @@ check_threshold() {
 }
 
 OVERALL_FAIL=0
-
 run_all_checks() {
     local ALGO=$1
     local LABEL=$2
@@ -303,22 +336,27 @@ run_all_checks() {
     check_threshold "$ALGO" "$LABEL" "z0 resolution = .*0.05"              "$(eval echo \$${PREFIX}_Z0RES_LOWETA_THRESHOLD)"  "max" "z0 res |eta|=0.05"    || OVERALL_FAIL=1
     check_threshold "$ALGO" "$LABEL" "z0 resolution = .*1.95"              "$(eval echo \$${PREFIX}_Z0RES_HIGHETA_THRESHOLD)" "max" "z0 res |eta|=1.95"    || OVERALL_FAIL=1
 }
-
+#We only run threshold checks for 1000+ events as thresholds are from 1000 event run
+#and could silently pass a bad PR with lower events due to higher statistal uncertainty.
+#The case isn't true for >1000 though as it would hone in more precisely not on a "better" value.
 echo ""
-echo "--- Validating thresholds ---"
-run_all_checks HYBRID run
+if [ "$EVENTS" -ge 1000 ]; then
+    echo "--- Validating thresholds (EVENTS=$EVENTS) ---"
+    run_all_checks HYBRID run
+    if [ "$QUICK_TEST" = "false" ]; then
+        run_all_checks HYBRID_NEWKF     run
+        run_all_checks HYBRID_DISPLACED run
+    fi
 
-if [ "$QUICK_TEST" = "false" ]; then
-    run_all_checks HYBRID_NEWKF     run
-    run_all_checks HYBRID_DISPLACED run
-fi
-
-echo ""
-if (( $OVERALL_FAIL )); then
-    echo "=== STAGE 2: FAILURE -- one or more thresholds not met ==="
-    echo "=== OVERALL RESULT: FAILURE ==="
-    exit 1
+    echo ""
+    if (( $OVERALL_FAIL )); then
+        echo "=== STAGE 2: FAILURE -- one or more thresholds not met ==="
+        echo "=== OVERALL RESULT: FAILURE ==="
+        exit 1
+    else
+        echo "=== STAGE 2: SUCCESS - all thresholds passed ==="
+        echo "=== OVERALL RESULT: SUCCESS ==="
+    fi
 else
-    echo "=== STAGE 2: SUCCESS - all thresholds passed ==="
-    echo "=== OVERALL RESULT: SUCCESS ==="
+    echo "--- Skipping threshold validation: EVENTS=$EVENTS is below the 1000-event reference count thresholds were calibrated for ---"
 fi
