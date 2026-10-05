@@ -1,6 +1,6 @@
 #!/bin/bash
-trap 'rm -f "$TEST_DIR"/job_*_cfg.py' EXIT
 set -e
+#trap comes later
 
 # =============================================================================
 # L1 Track CI - Master Unit Test
@@ -30,12 +30,19 @@ set -e
 # physics threshold comparison. See Stage 2 below.
 #
 # HOW TO USE:
-#   cd ~/<your CMSSW area>/src/
-#   cmsenv
-#   bash L1TKUnitTest.sh -e <num-events> -j <parallel-jobs>
-#   (defaults: -e 10 -j 1 if omitted)
-# Can instead run 'official' local unit test by adding L1TKUnitTest.sh to src/.../test/BuildFile.xml
-# Then run scram b runtests to run all 'registered' unit tests (from BuildFile.xml)
+#   'Unofficial' run:
+#       cd ~/<your CMSSW area>/src/
+#       cmsenv
+#       bash $CMSSW_BASE/src/L1Trigger/TrackFindingTracklet/test/L1TKUnitTest.sh -e <num-events> -j <parallel-jobs>
+#       (defaults: -e 10 -j 1 if omitted; can be run from any directory)
+#       Outputs are written to ./unit_test_results/ in the directory you run from.
+#
+#   'Official' run (L1TKUnitTest.sh registered in src/.../test/BuildFile.xml):
+#       From src/, run all registered unit tests:
+#           scram b runtests
+#       Or a single one:
+#           scram b runtests_<TestName>     (e.g. runtests_L1TKUnitTestLight)
+#   Under SCRAM, outputs go to $CMSSW_BASE/unit_tests/<TestName>/unit_test_results/
 # =============================================================================
 
 # =============================================================================
@@ -48,8 +55,23 @@ BRANCH_DEFAULT="L1TK-dev-${CMSSW_VERSION#CMSSW_}"
 GITHUB_USER_DEFAULT="cms-L1TK"
 # GITHUB_USER_UNDER_TEST and BRANCH_UNDER_TEST set automatically by cms-bot
 
-CFG_FILE="L1TrackNtupleMaker_cfg.py"
 TEST_DIR="$CMSSW_BASE/src/L1Trigger/TrackFindingTracklet/test"
+CFG_FILE="$TEST_DIR/L1TrackNtupleMaker_cfg.py"
+
+# =============================================================================
+# SANITY CHECK
+# =============================================================================
+if [ -z "$CMSSW_BASE" ]; then
+    echo "ERROR: CMSSW_BASE is not set. Run cmsenv before this script."
+    exit 1
+fi
+
+ORIG_CWD="$PWD"
+
+# Must come after ORIG_CWD is set, since the trap references it and
+# fires whenever the script exits (including on early failures).
+trap 'rm -f "$ORIG_CWD"/unit_test_results/job_*_cfg.py' EXIT
+
 
 # Set to "false" to also run HYBRID_NEWKF and HYBRID_DISPLACED.
 # When "true", only HYBRID (on ttbar+PU200) is run.
@@ -154,14 +176,6 @@ HYBRID_DISPLACED_Z0RES_LOWETA_REFERENCE="0.11"      HYBRID_DISPLACED_Z0RES_LOWET
 HYBRID_DISPLACED_Z0RES_HIGHETA_REFERENCE="0.42"     HYBRID_DISPLACED_Z0RES_HIGHETA_THRESHOLD="0.462"
 
 # =============================================================================
-# SANITY CHECK
-# =============================================================================
-if [ -z "$CMSSW_BASE" ]; then
-    echo "ERROR: CMSSW_BASE is not set. Run cmsenv before this script."
-    exit 1
-fi
-
-# =============================================================================
 # STAGE 1: Compile + Run
 # Compiles all checked out packages, then streams the appropriate MC dataset
 # directly and runs cmsRun for each algorithm.
@@ -199,16 +213,15 @@ run_hybrid_stage() {
         exit 1
     fi
 
-    cd $TEST_DIR
+    local RESULTSDIR="$ORIG_CWD/unit_test_results/${ALGO}_${RESULTS_LABEL}"
+    local JOBNAME="$ORIG_CWD/unit_test_results/job_${ALGO}_${RESULTS_LABEL}_cfg.py"
+    rm -rf "$RESULTSDIR"
+    mkdir -p "$RESULTSDIR"
+    cd "$RESULTSDIR"
 
-    JOBNAME="job_${ALGO}_${RESULTS_LABEL}_cfg.py"
-    cp $CFG_FILE $JOBNAME
-    sed -i "s|L1TRKALGO = 'HYBRID'|L1TRKALGO = '$ALGO'|" $JOBNAME
-    grep "^L1TRKALGO" $JOBNAME
-
-    RESULTSDIR="$TEST_DIR/unit_test_results/${ALGO}_${RESULTS_LABEL}"
-    rm -rf $RESULTSDIR
-    mkdir -p $RESULTSDIR
+    cp "$CFG_FILE" "$JOBNAME"
+    sed -i "s|L1TRKALGO = 'HYBRID'|L1TRKALGO = '$ALGO'|" "$JOBNAME"
+    grep -q "^L1TRKALGO = '$ALGO'" "$JOBNAME" || { echo "ERROR: failed to set L1TRKALGO=$ALGO"; exit 1; }
 
     echo "process.TFileService.fileName = cms.string('$RESULTSDIR/histos.root')" >> $JOBNAME
     echo "process.maxEvents = cms.untracked.PSet(input = cms.untracked.int32($EVENTS))" >> $JOBNAME
@@ -244,8 +257,7 @@ echo "=== STAGE 2: Analysis ==="
 run_makehists() {
     local ALGO=$1
     local RESULTS_LABEL=$2
-    local RESULTSDIR="$TEST_DIR/unit_test_results/${ALGO}_${RESULTS_LABEL}"
-
+    local RESULTSDIR="$ORIG_CWD/unit_test_results/${ALGO}_${RESULTS_LABEL}"
     echo ""
     echo "--- Running makeHists.csh for algo=$ALGO ---"
     cd $RESULTSDIR
@@ -256,7 +268,6 @@ run_makehists() {
         exit 1
     fi
     echo "--- makeHists.csh: SUCCESS ---"
-    cd $TEST_DIR
 }
 
 run_makehists HYBRID "run"
@@ -272,9 +283,7 @@ check_threshold() {
     local THRESHOLD=$4
     local MODE=$5
     local METRIC_NAME=$6
-
-    local RESULTSFILE="$TEST_DIR/unit_test_results/${ALGO}_${LABEL}/results.out"
-
+    local RESULTSFILE="$ORIG_CWD/unit_test_results/${ALGO}_${LABEL}/results.out"
     if [ ! -f "$RESULTSFILE" ]; then
         echo "FAILURE -- $RESULTSFILE not found"
         return 1
